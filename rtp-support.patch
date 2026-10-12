@@ -1,0 +1,337 @@
+diff --git a/README.md b/README.md
+index a9d7e80..19a69c0 100644
+--- a/README.md
++++ b/README.md
+@@ -15,6 +15,7 @@
+ - 支持多标签网页、收藏栏、广告拦截和多个命名用户脚本。
+ - 支持接收投屏、接管会话、遥控回传及独立鼠标指针渲染。
+ - 支持 M3U、M3U8、TXT 在线频道列表。
++- 新增 **RTP/UDP 视频源**：可直接播放 `rtp://`、`udp://`（含组播 `rtp://@239.0.0.1:5004`）以及 `srtp://` 实时流，按直播低延迟模式解码；组播流会自动申请 Wi-Fi 组播锁以保证接收。
+ - 可显示时间、日期、网速和播放调试信息。
+ - 支持开机自启动、在线更新和异常自动恢复。
+ - 最低支持 Android 4.0。
+@@ -105,6 +106,13 @@ Android 8.0 及以上系统如果阻止安装，请根据系统提示，允许
+ 
+ 先尝试自动选择解码器；仍无法播放时切换到兼容软解。不同电视芯片和系统固件的解码兼容性可能不同。
+ 
++### RTP/UDP 无法播放或只有黑屏
++
++- 确认频道地址格式为 `rtp://` 或 `udp://`；组播地址请写成 `rtp://@239.0.0.1:5004`（注意 `@`）。
++- 组播流依赖局域网 IGMP 与 Wi-Fi 组播锁，建议连接网线或确认路由器未禁用 IGMP/组播；应用已自动申请组播锁。
++- 若流使用动态负载（如非标准 H.264/HEVC）需要 SDP 描述，请通过 SDP 文件或带 SDP 的地址提供，否则 FFmpeg 可能无法识别编码。
++- 仍无法播放时，在设置中切换“兼容软解”排除硬件解码器兼容问题。
++
+ ## 手动打正式包（Windows）
+ 
+ 双击项目根目录的 `build-release.bat`，即可调用 `scripts/build-release.ps1`，生成 ARM32、ARM64、x86 正式包并更新版本文件。打包结束后窗口会保留，方便查看成功信息或错误原因。
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index b11790a..32219dc 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -13,6 +13,8 @@
+     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
++    <!-- Receiving multicast RTP/UDP over Wi-Fi requires holding the multicast lock. -->
++    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+     <!-- targetSdk 25 uses the legacy Wi-Fi Direct permission contract. Discovery
+          therefore needs fine location on Android 6+, even on Android 13+. -->
+     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+diff --git a/app/src/main/assets/control/js/pages/channels.js b/app/src/main/assets/control/js/pages/channels.js
+index acf76c4..6d68151 100644
+--- a/app/src/main/assets/control/js/pages/channels.js
++++ b/app/src/main/assets/control/js/pages/channels.js
+@@ -537,7 +537,7 @@ function playlistAddressProblem(value, sourceLocation) {
+   if (/%(?![0-9a-f]{2})/i.test(text)) return "百分号后需要两位十六进制编码，例如空格应写为 %20";
+   if (text.indexOf("#") !== text.lastIndexOf("#")) return "网址中包含重复的 # 分隔符";
+   if (/^webview:\/\//i.test(text) && !sourceLocation) text = text.replace(/^webview:\/\//i, "");
+-  var absolute = /^(https?|rtmps?|rtmpt|rtsp):\/\/([^/?#]+)/i.exec(text);
++  var absolute = /^(https?|rtmps?|rtmpt|rtsp|rtp|udp|srtp):\/\/([^/?#]+)/i.exec(text);
+   if (absolute) {
+     if (sourceLocation && !/^https?:/i.test(text)) return "频道列表来源需要 HTTP/HTTPS 地址，或选择本地文件";
+     if (typeof URL === "function") {
+@@ -677,7 +677,7 @@ function playlistAttribute(line, name) {
+ 
+ function playlistStreamUrl(value, base) {
+   var text = String(value || "").replace(/^\s+|\s+$/g, "");
+-  if (/^(https?|rtmps?|rtmpt|rtsp|webview):\/\//i.test(text)) return text;
++  if (/^(https?|rtmps?|rtmpt|rtsp|rtp|udp|srtp|webview):\/\//i.test(text)) return text;
+   if (!/^https?:\/\//i.test(base)) return "";
+   try {
+     return new URL(text, base).href;
+@@ -769,7 +769,7 @@ function parsePlaylistOnPhone(text, source) {
+       continue;
+     }
+     // Ignore empty columns before an explicit URL, never commas inside its query.
+-    value = value.replace(/^(?:,\s*)+(?=(?:https?|rtmps?|rtmpt|rtsp|webview):\/\/)/i, "");
++    value = value.replace(/^(?:,\s*)+(?=(?:https?|rtmps?|rtmpt|rtsp|rtp|udp|srtp|webview):\/\/)/i, "");
+     url = stream(value, i + 1, lines[i]);
+     if (url)
+       entries.push({
+diff --git a/app/src/main/java/xiao/bu/tv/MainActivity.java b/app/src/main/java/xiao/bu/tv/MainActivity.java
+index b8aef0d..6a09ef2 100644
+--- a/app/src/main/java/xiao/bu/tv/MainActivity.java
++++ b/app/src/main/java/xiao/bu/tv/MainActivity.java
+@@ -23,6 +23,7 @@ import android.graphics.Paint;
+ import android.graphics.Rect;
+ import android.graphics.drawable.GradientDrawable;
+ import android.net.Uri;
++import android.net.wifi.WifiManager;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.CpuUsageInfo;
+@@ -731,6 +732,10 @@ public final class MainActivity extends Activity {
+ 
+     private String receiverCastTransport = RTSP_TRANSPORT_TCP;
+ 
++    /** Held while a multicast RTP/UDP stream is playing so Wi-Fi devices keep
++     *  receiving group traffic (otherwise the power-save filter drops it). */
++    private WifiManager.MulticastLock rtpMulticastLock;
++
+     private volatile String clockLocation;
+     private volatile boolean showDebugInfo;
+     private volatile boolean showNetworkSpeed;
+@@ -7473,6 +7478,7 @@ public final class MainActivity extends Activity {
+             proxy.selectVideoVariant(savedVideo.startsWith("hls:") ? savedVideo.substring(4) : "");
+         }
+         final boolean realtimeCastSource = isNtVCastSource(streamUrl);
++        final boolean realtimeRtpStream = isRtpUdpSource(streamUrl);
+         final boolean legacyMediaCodec = Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT
+                 || lowResourceDevice
+                 || realtimeCastSource
+@@ -7521,20 +7527,21 @@ public final class MainActivity extends Activity {
+         requestPlaybackAudioFocus();
+         float playbackVolume = isPlaybackMuted() ? 0f : 1f;
+         nextPlayer.setVolume(playbackVolume, playbackVolume);
+-        // Keep every compressed reference frame for realtime casting. IJK's
++        // Keep every compressed reference frame for realtime casting and RTP/UDP. IJK's
+         // generic framedrop can skip a HEVC reference before MediaCodec sees it,
+         // leaving old receivers gray until the next IDR.
+         // Old devices can fall back to software even in automatic hardware mode.
+         // Use the same late-frame budget as explicit software playback so costly
+         // video conversion does not keep falling further behind the audio clock.
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop",
+-                realtimeCastSource ? 0 : (softwareDecode
++                realtimeCastSource || realtimeRtpStream ? 0 : (softwareDecode
+                         || Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT) ? 5 : 1);
+         if (realtimeCastSource) receiverNetworkLease.acquire(this);
++        if (realtimeRtpStream) acquireRtpMulticastLock(streamUrl);
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "ntv-live-video",
+-                realtimeCastSource ? 1 : 0);
++                realtimeCastSource || realtimeRtpStream ? 1 : 0);
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "ntv-frame-sync",
+-                !softwareDecode && !realtimeCastSource ? 1 : 0);
++                !softwareDecode && !realtimeCastSource && !realtimeRtpStream ? 1 : 0);
+         if (!softwareDecode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+             nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-fps", -1);
+         }
+@@ -7542,7 +7549,7 @@ public final class MainActivity extends Activity {
+                 realtimeCastSource && BuildConfig.DEBUG && BuildConfig.CAST_LATENCY_TRACE ? 1 : 0);
+         final boolean remoteCatalogPlayback = isRemoteCatalogPlayback();
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering",
+-                realtimeCastSource ? 0 : 1);
++                realtimeCastSource || realtimeRtpStream ? 0 : 1);
+         final boolean cctvSource = isActiveCctvWebSource();
+         final boolean yangshipinSource = activeEmbeddedYangshipinResolver
+                 || proxyStatefulCmgSource && channel.yangshipinPid != null;
+@@ -7561,7 +7568,7 @@ public final class MainActivity extends Activity {
+                 && !realtimeCastSource && !remoteCatalogPlayback
+                 && (streamUrl.startsWith("http://") || streamUrl.startsWith("https://"));
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames",
+-                realtimeCastSource ? 2
++                realtimeCastSource || realtimeRtpStream ? 2
+                         : remoteCatalogPlayback ? 20
+                         : cctvSource || genericLiveHls ? liveIjkMinFrames()
+                         : (bufferedHttpMedia ? 360 : 60));
+@@ -7574,27 +7581,32 @@ public final class MainActivity extends Activity {
+             nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER,
+                     "max-buffer-size", bufferMiB * 1024 * 1024);
+         }
+-        nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "infbuf", 0);
++        nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "infbuf",
++                realtimeCastSource || realtimeRtpStream ? 1 : 0);
+         // The cast sender already starts both RTP tracks from the same session.
+         // Waiting for IJK's generic A/V startup gate can retain the first burst on
+         // old televisions before either clock begins advancing.
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "sync-av-start",
+-                realtimeCastSource ? 0 : 1);
++                realtimeCastSource || realtimeRtpStream ? 0 : 1);
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration",
+                 realtimeCastSource ? 250
++                        : realtimeRtpStream ? 800
+                         : remoteCatalogPlayback ? 30000
+                         : cctvSource ? 45000
+                         : (genericLiveHls ? 30000 : 45000));
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "first-high-water-mark-ms",
+                 realtimeCastSource ? 100
++                        : realtimeRtpStream ? 150
+                         : remoteCatalogPlayback ? 800
+                         : cctvSource || genericLiveHls ? liveIjkFirstBufferMs()
+                         : 5000);
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "next-high-water-mark-ms",
+-                realtimeCastSource ? 80 : remoteCatalogPlayback ? 3000
++                realtimeCastSource ? 80 : realtimeRtpStream ? 120
++                        : remoteCatalogPlayback ? 3000
+                         : cctvSource || genericLiveHls ? liveIjkNextBufferMs() : 5000);
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "last-high-water-mark-ms",
+-                realtimeCastSource ? 150 : remoteCatalogPlayback ? 5000
++                realtimeCastSource ? 150 : realtimeRtpStream ? 200
++                        : remoteCatalogPlayback ? 5000
+                         : cctvSource || genericLiveHls ? liveIjkLastBufferMs() : 5000);
+         nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect", 1);
+         if (isRtspSource(streamUrl)) {
+@@ -7631,12 +7643,30 @@ public final class MainActivity extends Activity {
+                     "max_delay", 30000);
+             nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
+                     "reorder_queue_size", 16);
++        } else if (realtimeRtpStream) {
++            // RTP/UDP is a realtime transport: start rendering on the first frame and
++            // smooth jitter with a small reorder window instead of buffering. analyzeduration
++            // stays generous so the dynamic RTP payload (H.264/HEVC/MPEG-TS/...) is detected
++            // reliably before playback begins.
++            nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
++                    "buffer_size", 1024 * 1024);
++            nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
++                    "analyzeduration", 2000000);
++            nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
++                    "fflags", "nobuffer");
++            nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
++                    "max_delay", 500000);
++            nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
++                    "reorder_queue_size", 16);
++            // FFmpeg must be allowed to open the underlying rtp/udp (and srtp) socket.
++            nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "protocol_whitelist",
++                    "rtp,udp,udplite,srtp,file,cache,tcp,http,https,rtmpt,rtmps");
+         }
+         if (legacyCctvStartup) {
+             // Known H.264/AAC live TS streams expose both tracks in the first segment.
+             // Don't wait for a multi-second generic stream probe before showing video.
+             nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 1000000);
+-        } else if (genericThirdPartySource) {
++        } else if (genericThirdPartySource && !realtimeRtpStream) {
+             // Legacy TS services may announce audio late or begin between GOPs. The
+             // previous 256 KiB probe could therefore produce picture without sound.
+             nextPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT,
+@@ -8205,8 +8235,19 @@ public final class MainActivity extends Activity {
+                 && sourceUrl.trim().toLowerCase(Locale.US).startsWith("rtsp://");
+     }
+ 
++    /** RTP/UDP (and SRTP) are realtime native transports handled directly by IJK/FFmpeg,
++     *  exactly like RTSP. They must bypass the HLS proxy and the Android platform player. */
++    private static boolean isRtpUdpSource(String sourceUrl) {
++        if (sourceUrl == null) {
++            return false;
++        }
++        String value = sourceUrl.trim().toLowerCase(Locale.US);
++        return value.startsWith("rtp://") || value.startsWith("udp://")
++                || value.startsWith("srtp://");
++    }
++
+     private static boolean isNativeStreamingSource(String sourceUrl) {
+-        return isRtmpSource(sourceUrl) || isRtspSource(sourceUrl);
++        return isRtmpSource(sourceUrl) || isRtspSource(sourceUrl) || isRtpUdpSource(sourceUrl);
+     }
+ 
+     private boolean isRemoteCatalogPlayback() {
+@@ -8244,6 +8285,62 @@ public final class MainActivity extends Activity {
+                 ? RTSP_TRANSPORT_UDP : RTSP_TRANSPORT_TCP;
+     }
+ 
++    /** Acquire a Wi-Fi multicast lock while a multicast RTP/UDP stream plays.
++     *  Without it, many Android Wi-Fi chipsets drop group traffic in power-save
++     *  mode and the receiver never sees a single packet. */
++    private void acquireRtpMulticastLock(String streamUrl) {
++        if (rtpMulticastLock != null && rtpMulticastLock.isHeld()) return;
++        if (!isMulticastStreamHost(streamUrl)) return;
++        try {
++            WifiManager wifiManager = (WifiManager) getApplicationContext()
++                    .getSystemService(Context.WIFI_SERVICE);
++            if (wifiManager == null) return;
++            rtpMulticastLock = wifiManager.createMulticastLock("nTvRtp");
++            rtpMulticastLock.setReferenceCounted(false);
++            rtpMulticastLock.acquire();
++            Log.i(TAG, "Acquired Wi-Fi multicast lock for " + streamUrl);
++        } catch (RuntimeException error) {
++            Log.w(TAG, "Unable to acquire multicast lock", error);
++        }
++    }
++
++    private void releaseRtpMulticastLock() {
++        if (rtpMulticastLock != null && rtpMulticastLock.isHeld()) {
++            try { rtpMulticastLock.release(); } catch (RuntimeException ignored) { }
++            Log.i(TAG, "Released Wi-Fi multicast lock");
++        }
++        rtpMulticastLock = null;
++    }
++
++    /** True when the host of an rtp://, udp:// or srtp:// URL is a multicast address
++     *  (IPv4 224.0.0.0-239.255.255.255 or IPv6 ff00::/8). Unicast streams never need
++     *  the multicast lock and must not acquire it. */
++    private static boolean isMulticastStreamHost(String streamUrl) {
++        if (streamUrl == null) return false;
++        // Multicast URLs keep the leading '@' (e.g. rtp://@239.0.0.1:5004).
++        int schemeEnd = streamUrl.indexOf("://");
++        if (schemeEnd < 0) return false;
++        String rest = streamUrl.substring(schemeEnd + 3);
++        int at = rest.indexOf('@');
++        String host = at >= 0 ? rest.substring(at + 1) : rest;
++        int colon = host.indexOf(':');
++        if (colon >= 0) host = host.substring(0, colon);
++        int slash = host.indexOf('/');
++        if (slash >= 0) host = host.substring(0, slash);
++        if (host.length() == 0) return false;
++        if (Character.isDigit(host.charAt(0))) {
++            String[] parts = host.split("\\.");
++            if (parts.length == 4) {
++                try {
++                    int first = Integer.parseInt(parts[0]);
++                    return first >= 224 && first <= 239;
++                } catch (NumberFormatException ignored) { }
++            }
++            return false;
++        }
++        return host.toLowerCase(Locale.US).startsWith("ff");
++    }
++
+     private static String legacyWebViewUserScripts(String source) throws JSONException {
+         JSONArray scripts = new JSONArray();
+         String safeSource = source == null ? "" : source;
+@@ -10713,6 +10810,7 @@ public final class MainActivity extends Activity {
+         cancelRemoteResolve();
+         receiverStreamSessionId = "";
+         receiverNetworkLease.release();
++        releaseRtpMulticastLock();
+         mediaTrackChangeGeneration++;
+         stopHlsSubtitle();
+         mediaTrackManifest=null;
+diff --git a/app/src/main/java/xiao/bu/tv/PlaylistManager.java b/app/src/main/java/xiao/bu/tv/PlaylistManager.java
+index ca81333..fd62ecf 100644
+--- a/app/src/main/java/xiao/bu/tv/PlaylistManager.java
++++ b/app/src/main/java/xiao/bu/tv/PlaylistManager.java
+@@ -1420,7 +1420,7 @@ final class PlaylistManager {
+                 String value = line.substring(comma + 1).trim();
+                 // Accept empty CSV fields produced by PHP/TXT playlist generators.
+                 // Preserve every character inside a real URL (including query commas).
+-                value = value.replaceFirst("(?i)^(?:,\\s*)+(?=(?:https?|rtmps?|rtmpt|rtsp|webview)://)", "");
++                value = value.replaceFirst("(?i)^(?:,\\s*)+(?=(?:https?|rtmps?|rtmpt|rtsp|rtp|udp|srtp|webview)://)", "");
+                 if (value.matches("(?i)#genre#(?:\\s*,\\s*)*")) {
+                     currentGroup = name.length() == 0 ? "在线频道" : name;
+                 } else if (isStreamUrl(value)) {
+@@ -1432,7 +1432,7 @@ final class PlaylistManager {
+             }
+         }
+         if (count == 0) {
+-            throw new IOException("频道源中没有找到可播放的 HTTP 或 WebView 地址");
++            throw new IOException("频道源中没有找到可播放的 HTTP、RTSP、RTP/UDP 或 WebView 地址");
+         }
+         ChannelCatalog.Group[] result = new ChannelCatalog.Group[groups.size()];
+         int index = 0;
+@@ -1617,6 +1617,8 @@ final class PlaylistManager {
+                 || value.startsWith("rtmp://") || value.startsWith("rtmpt://")
+                 || value.startsWith("rtmps://")
+                 || value.startsWith("rtsp://")
++                || value.startsWith("rtp://") || value.startsWith("udp://")
++                || value.startsWith("srtp://")
+                 || value.startsWith("webview://http://")
+                 || value.startsWith("webview://https://");
+     }
